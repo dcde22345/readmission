@@ -1,25 +1,25 @@
 import numpy as np
-from tqdm import tqdm
-
 import torch
-
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-
 import pandas as pd
 import matplotlib.pyplot as plt
+import seaborn as sns
+import matplotlib
+from tqdm import tqdm
+import traceback
 
 from torch.utils.data import Dataset, DataLoader
 from torchkeras.tabular import TabularPreprocessor, TabularDataset
 from torchkeras.tabular.models import FTTransformerConfig, FTTransformerModel
 
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
-
 from src.imbalance_data_processing import apply_smote, apply_under_sampling
-
 from sklearn.preprocessing import LabelEncoder
-
+from sklearn.metrics import roc_curve, auc, precision_score, recall_score, f1_score
+from sklearn.model_selection import KFold
+from sklearn.utils.class_weight import compute_class_weight
 
 np.random.seed(42)
 
@@ -31,11 +31,18 @@ NUMERICAL_COLUMNS = [f'num_{i}' for i in range(len(NUMERICAL_FEATURES))]
 CATEGORICAL_COLUMNS = [f'cat_{i}' for i in range(len(CATEGORICAL_FEATURES))]
 
 class CustomerFTTransformer:
-    def __init__(self):
-        self.scaler = StandardScaler()
+    def __init__(self, num_attn_blocks=1, dropout=0.1):
+        self.num_attn_blocks = num_attn_blocks
+        self.dropout = dropout
+
+        # 讀取訓練數據
         self.train_df = pd.read_csv("data/train_df.csv")
+
+        # 對訓練數據進行shuffle，確保數據隨機性
+        self.train_df = self.train_df.sample(frac=1, random_state=42).reset_index(drop=True)
         self.test_df_test_csv = pd.read_csv("data/test_df.csv")
 
+        self.scaler = StandardScaler()
         # 使用 TabularPreprocessor 進行預處理
         self.preprocessor = TabularPreprocessor(
             cat_features=CATEGORICAL_COLUMNS,  # 類別特徵
@@ -47,7 +54,11 @@ class CustomerFTTransformer:
         self.model_config = FTTransformerConfig(
             # ModelConfig 參數
             task="classification",  # 二元分類
-            num_attn_blocks=3,
+            num_attn_blocks=self.num_attn_blocks,  # 使用實例變量
+            ff_dropout=self.dropout,
+            attn_dropout=self.dropout,
+            embedding_dropout=self.dropout,
+            add_norm_dropout=self.dropout,
         )
 
         self.model = None
@@ -99,7 +110,6 @@ class CustomerFTTransformer:
         return train_test_split(
             X_num, X_cat, y, test_size=0.2, random_state=42
         )
-
 
     def preprocess(self, use_smote=False, use_under_sampling=False, smote_method='smotenc', under_sampling_method='tomek'):
         X_num_train, X_num_test, X_cat_train, X_cat_test, y_train, y_test = self._split_train_test()
@@ -235,8 +245,8 @@ class CustomerFTTransformer:
             categorical_cols=self.embedding_features_processed
         )
 
-        self.dl_train = DataLoader(self.ds_train, batch_size=128, shuffle=False, num_workers=0, pin_memory=False)
-        self.dl_test = DataLoader(self.ds_test, batch_size=128, shuffle=False, num_workers=0, pin_memory=False)
+        self.dl_train = DataLoader(self.ds_train, batch_size=256, shuffle=False, num_workers=4, pin_memory=True, persistent_workers=True)
+        self.dl_test = DataLoader(self.ds_test, batch_size=256, shuffle=False, num_workers=4, pin_memory=True, persistent_workers=True)
 
         print("categorical features (cols):", self.embedding_features_processed)
         print("categorical features (array):", self.train_df_train_csv_processed[self.embedding_features_processed].shape[1])
@@ -251,17 +261,52 @@ class CustomerFTTransformer:
         self.model = FTTransformerModel(self.config)
 
     # 訓練模型
-    def train_model(self, num_epochs: int, model_name: str, use_class_weight=False, plot_train_metrics=True):
+    def train_model(self, num_epochs: int, model_name: str, use_class_weight=False, plot_train_metrics=True,
+                   enable_cv=False, k_folds=3, save_best_model=True, early_stopping=True, patience=10, min_delta=1e-4):
         """
-        訓練 FT-Transformer 模型
+        訓練 FT-Transformer 模型（支持 Cross Validation）
         
         Args:
             num_epochs (int): 訓練輪數
             model_name (str): 模型保存名稱
             use_class_weight (bool): 是否使用 class weight 來處理類別不平衡
             plot_train_metrics (bool): 是否在訓練後繪製訓練集的ROC和混淆矩陣
+            enable_cv (bool): 是否啟用 Cross Validation
+            k_folds (int): K-fold CV 的 fold 數量（當 enable_cv=True 時有效）
+            save_best_model (bool): 是否保存最佳模型（CV模式下）
+            early_stopping (bool): 是否啟用 early stopping
+            patience (int): early stopping 的耐心值（多少個 epoch 沒有改善就停止）
+            min_delta (float): 最小改善閾值
+            
+        Returns:
+            dict: 訓練結果（包含CV結果如果啟用的話）
         """
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        
+        # 顯示GPU信息
+        if torch.cuda.is_available():
+            print(f"🖥️ GPU 可用: {torch.cuda.get_device_name(0)}")
+            print(f"🔢 可用GPU數量: {torch.cuda.device_count()}")
+            print(f"💾 GPU記憶體: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+            if torch.cuda.device_count() > 1:
+                print(f"🚀 將使用 {torch.cuda.device_count()} 個GPU進行訓練")
+        else:
+            print("⚠️ 未檢測到CUDA設備，將使用CPU訓練")
+        
+        if not enable_cv:
+            # 原有的常規訓練模式
+            self._train_single_model(num_epochs, model_name, use_class_weight, 
+                                          plot_train_metrics, device, early_stopping, patience, min_delta)
+        else:
+            # Cross Validation 模式
+            self._train_with_cross_validation(num_epochs, model_name, use_class_weight,
+                                                   k_folds, save_best_model, device, early_stopping, patience, min_delta)
+    
+    # 單一模型訓練
+    def _train_single_model(self, num_epochs, model_name, use_class_weight, plot_train_metrics, device, early_stopping, patience, min_delta):
+        """
+        原有的單一模型訓練方法
+        """
         optimizer = torch.optim.Adam(self.model.parameters(), lr=1e-3)
         
         # 計算並設定 class weights
@@ -274,6 +319,12 @@ class CustomerFTTransformer:
             print("Using standard CrossEntropyLoss (no class weights)")
 
         self.model.to(device)
+        
+        # 多GPU支持
+        if torch.cuda.device_count() > 1:
+            print(f"🔗 Using {torch.cuda.device_count()} GPUs for training")
+            self.model = torch.nn.DataParallel(self.model)
+        
         self.model.train()
 
         progress_bar = tqdm(range(num_epochs), leave=False)
@@ -294,15 +345,382 @@ class CustomerFTTransformer:
             progress_bar.set_description(f"Epoch {epoch+1}/{num_epochs} | Avg. Loss: {total_loss/len(self.dl_train):.4f}")
         
         # 儲存模型（建議用 .pt 或 .pth）
-        torch.save(self.model.state_dict(), f'./models/{model_name}')
+        model_to_save = self.model.module if hasattr(self.model, 'module') else self.model
+        torch.save(model_to_save.state_dict(), f'./models/{model_name}')
         print(f"Model saved as ./models/{model_name}")
         
         # 繪製訓練集評估指標
         if plot_train_metrics:
             print("\n=== Training Set Evaluation ===")
-            self.evaluate_train_set()
+            self.evaluate_train_set(model_name=model_name)
+            
+        return {"model_name": model_name, "training_completed": True}
+    
+    # 交叉驗證訓練
+    def _train_with_cross_validation(self, num_epochs, model_name, use_class_weight, k_folds, save_best_model, device, early_stopping, patience, min_delta):
+        """
+        執行 K-fold Cross Validation 訓練
+        """
+        
+        print(f"\n🔄 開始 {k_folds}-Fold Cross Validation 訓練...")
+        
+        # 準備完整的訓練數據
+        X_train_full = self.train_df_train_csv_processed.values
+        y_train_full = self.train_target_df.values
+        
+        # 初始化 KFold
+        kfold = KFold(n_splits=k_folds, shuffle=True, random_state=42)
+        
+        # 儲存每個 fold 的結果
+        cv_results = {
+            'fold_accuracies': [],
+            'fold_losses': [],
+            'fold_models': [],
+            'fold_metrics': [],
+            'mean_accuracy': 0.0,
+            'std_accuracy': 0.0,
+            'mean_loss': 0.0,
+            'std_loss': 0.0
+        }
+        
+        best_accuracy = 0.0
+        best_model_state = None
+        best_fold = -1
+        
+        # 執行 K-fold CV
+        for fold, (train_idx, val_idx) in enumerate(kfold.split(X_train_full)):
+            print(f"\n📋 Fold {fold + 1}/{k_folds}")
+            print("-" * 50)
+            
+            # 分割當前 fold 的數據
+            X_train_fold = X_train_full[train_idx]
+            X_val_fold = X_train_full[val_idx]
+            y_train_fold = y_train_full[train_idx]
+            y_val_fold = y_train_full[val_idx]
+            
+            # 創建當前 fold 的 DataLoader
+            train_dl_fold, val_dl_fold = self._create_fold_dataloaders(
+                X_train_fold, X_val_fold, y_train_fold, y_val_fold
+            )
+            
+            # 重新初始化模型（每個 fold 使用新的模型）
+            model_fold = FTTransformerModel(config=self.config)
+            model_fold.to(device)
 
-    def evaluate_train_set(self):
+            # 訓練當前 fold 的模型
+            fold_accuracy, fold_loss, model_state = self._train_fold(
+                model_fold, train_dl_fold, val_dl_fold, num_epochs, 
+                use_class_weight, device, fold + 1, early_stopping, patience, min_delta
+            )
+            
+            # 保存結果
+            cv_results['fold_accuracies'].append(fold_accuracy)
+            cv_results['fold_losses'].append(fold_loss)
+            cv_results['fold_models'].append(model_state)
+            
+            # 詳細評估當前 fold
+            fold_metrics = self._evaluate_fold(model_fold, val_dl_fold, device)
+            cv_results['fold_metrics'].append(fold_metrics)
+            
+            # 檢查是否是最佳模型
+            if fold_accuracy > best_accuracy:
+                best_accuracy = fold_accuracy
+                best_model_state = model_state
+                best_fold = fold + 1
+            
+            print(f"Fold {fold + 1} - Validation Accuracy: {fold_accuracy:.4f}, Loss: {fold_loss:.4f}")
+        
+        # 計算 CV 統計結果
+        cv_results['mean_accuracy'] = np.mean(cv_results['fold_accuracies'])
+        cv_results['std_accuracy'] = np.std(cv_results['fold_accuracies'])
+        cv_results['mean_loss'] = np.mean(cv_results['fold_losses'])
+        cv_results['std_loss'] = np.std(cv_results['fold_losses'])
+        cv_results['best_fold'] = best_fold
+        cv_results['best_accuracy'] = best_accuracy
+        
+        # 保存最佳模型
+        if save_best_model and best_model_state is not None:
+            # 載入最佳模型到當前的instance
+            self.model.load_state_dict(best_model_state)
+            
+            # 保存最佳模型
+            torch.save(best_model_state, f'./models/{model_name}_best_cv.pth')
+            print(f"💾 最佳模型已保存: ./models/{model_name}_best_cv.pth (來自 Fold {best_fold})")
+            
+        # 輸出CV總結
+        print(f"\n{'='*60}")
+        print(f"🎯 Cross Validation 總結")
+        print(f"{'='*60}")
+        print(f"平均準確率: {cv_results['mean_accuracy']:.4f} ± {cv_results['std_accuracy']:.4f}")
+        print(f"平均損失: {cv_results['mean_loss']:.4f} ± {cv_results['std_loss']:.4f}")
+        print(f"最佳模型來自: Fold {best_fold} (準確率: {best_accuracy:.4f})")
+        print(f"{'='*60}")
+        
+        cv_results['cv_completed'] = True
+
+
+        # 繪製每個fold的混淆矩陣
+        print("\n📊 Plotting confusion matrices for each fold...")
+        for fold_idx, fold_metric in enumerate(cv_results['fold_metrics']):
+            plt.figure(figsize=(10, 8))
+            cm = confusion_matrix(fold_metric['true_labels'], fold_metric['predictions'])
+            
+            # 使用seaborn繪製混淆矩陣熱圖
+            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
+            plt.title(f'Confusion Matrix - Fold {fold_idx + 1}')
+            plt.ylabel('True Label')
+            plt.xlabel('Predicted Label')
+            
+            # 保存圖片
+            plt.savefig(f'./images/{model_name}_fold{fold_idx + 1}_cm.png')
+            plt.close()
+            
+            print(f"Confusion matrix for fold {fold_idx + 1} saved as: ./images/{model_name}_fold{fold_idx + 1}_cm.png")
+        
+        return cv_results
+    
+    # 為當前 fold 創建 DataLoader
+    def _create_fold_dataloaders(self, X_train_fold, X_val_fold, y_train_fold, y_val_fold, batch_size=128):
+        """
+        為當前 fold 創建 DataLoader
+        """
+        # 轉換為 DataFrame 格式
+        train_fold_df = pd.DataFrame(X_train_fold, columns=self.train_df_train_csv_processed.columns)
+        val_fold_df = pd.DataFrame(X_val_fold, columns=self.train_df_train_csv_processed.columns)
+        
+        # 添加 target 列
+        train_fold_df['target'] = y_train_fold
+        val_fold_df['target'] = y_val_fold
+        
+        # 創建 TabularDataset
+        train_ds_fold = TabularDataset(
+            data=train_fold_df,
+            task='classification',
+            target=['target'],
+            continuous_cols=self.numerical_features_processed,
+            categorical_cols=self.embedding_features_processed
+        )
+        
+        val_ds_fold = TabularDataset(
+            data=val_fold_df,
+            task='classification',
+            target=['target'],
+            continuous_cols=self.numerical_features_processed,
+            categorical_cols=self.embedding_features_processed
+        )
+        
+        # 創建 DataLoader（GPU 優化設置）
+        train_dl_fold = DataLoader(
+            train_ds_fold, 
+            batch_size=batch_size, 
+            shuffle=True, 
+            num_workers=4, 
+            pin_memory=True, 
+            persistent_workers=True,
+            drop_last=True  # 避免最後一個batch太小
+        )
+        val_dl_fold = DataLoader(
+            val_ds_fold, 
+            batch_size=batch_size, 
+            shuffle=False, 
+            num_workers=4, 
+            pin_memory=True, 
+            persistent_workers=True
+        )
+        
+        return train_dl_fold, val_dl_fold
+    
+    # 訓練單個 fold 的模型（支持 Early Stopping）
+    def _train_fold(self, model, train_dl, val_dl, num_epochs, use_class_weight, device, fold_num, early_stopping, patience, min_delta):
+        """
+        訓練單個 fold 的模型（支持 Early Stopping）
+        """
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        
+        # 設定損失函數
+        if use_class_weight:
+            class_weight_tensor = self._compute_class_weights(device)
+            criterion = torch.nn.CrossEntropyLoss(weight=class_weight_tensor)
+        else:
+            criterion = torch.nn.CrossEntropyLoss()
+        
+        model.to(device)
+        model.train()
+        
+        # Early Stopping 相關變數
+        best_val_loss = float('inf')
+        patience_counter = 0
+        best_model_state = None
+        early_stopped = False
+        
+        # 訓練循環
+        progress_bar = tqdm(range(num_epochs), leave=False, desc=f"Fold {fold_num}")
+        for epoch in progress_bar:
+            # === 訓練階段 ===
+            model.train()
+            total_train_loss = 0
+            for batch in train_dl:
+                numerical = batch['continuous'].to(device)
+                categorical = batch['categorical'].to(device)
+                target = batch['target'].to(device).squeeze()
+                
+                optimizer.zero_grad()
+                outputs = model({'continuous': numerical, 'categorical': categorical})
+                logits = outputs['logits']
+                loss = criterion(logits, target)
+                loss.backward()
+                optimizer.step()
+                total_train_loss += loss.item()
+            
+            avg_train_loss = total_train_loss / len(train_dl)
+            
+            # === 驗證階段 ===
+            model.eval()
+            total_val_loss = 0
+            correct = 0
+            total = 0
+            
+            with torch.no_grad():
+                for batch in val_dl:
+                    numerical = batch['continuous'].to(device)
+                    categorical = batch['categorical'].to(device)
+                    target = batch['target'].to(device).squeeze()
+                    
+                    outputs = model({'continuous': numerical, 'categorical': categorical})
+                    logits = outputs['logits']
+                    loss = criterion(logits, target)
+                    
+                    total_val_loss += loss.item()
+                    _, predicted = torch.max(logits, 1)
+                    total += target.size(0)
+                    correct += (predicted == target).sum().item()
+            
+            avg_val_loss = total_val_loss / len(val_dl)
+            val_accuracy = correct / total
+            
+            # === Early Stopping 檢查 ===
+            if early_stopping:
+                # 檢查是否有改善
+                if avg_val_loss < best_val_loss - min_delta:
+                    best_val_loss = avg_val_loss
+                    patience_counter = 0
+                    model_to_save = model.module if hasattr(model, 'module') else model
+                    best_model_state = model_to_save.state_dict().copy()
+                else:
+                    patience_counter += 1
+                
+                # 檢查是否需要 early stop
+                if patience_counter >= patience:
+                    early_stopped = True
+                    print(f"\n⏹️ Early stopping triggered at epoch {epoch + 1}")
+                    print(f"Best validation loss: {best_val_loss:.4f}")
+                    break
+            else:
+                # 不使用 early stopping 時，總是保存最新的模型
+                if avg_val_loss < best_val_loss:
+                    best_val_loss = avg_val_loss
+                    model_to_save = model.module if hasattr(model, 'module') else model
+                    best_model_state = model_to_save.state_dict().copy()
+            
+            # 更新進度條
+            progress_bar.set_description(
+                f"Fold {fold_num} - Epoch {epoch+1}/{num_epochs} | "
+                f"Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | "
+                f"Val Acc: {val_accuracy:.4f} | Patience: {patience_counter}/{patience}"
+            )
+        
+        # 恢復最佳模型
+        if best_model_state is not None:
+            model.load_state_dict(best_model_state)
+        
+        # 最終驗證
+        final_val_accuracy, final_val_loss = self._validate_fold(model, val_dl, criterion, device)
+        
+        # 輸出訓練結果
+        if early_stopped:
+            print(f"✅ Fold {fold_num} completed with early stopping after {epoch + 1} epochs")
+        else:
+            print(f"✅ Fold {fold_num} completed full training ({num_epochs} epochs)")
+        
+        print(f"Final validation - Accuracy: {final_val_accuracy:.4f}, Loss: {final_val_loss:.4f}")
+        
+        # 返回時確保返回正確的模型狀態
+        if best_model_state is not None:
+            return final_val_accuracy, final_val_loss, best_model_state
+        else:
+            model_to_save = model.module if hasattr(model, 'module') else model
+            return final_val_accuracy, final_val_loss, model_to_save.state_dict().copy()
+    
+    # 在驗證集上評估模型
+    def _validate_fold(self, model, val_dl, criterion, device):
+        """
+        在驗證集上評估模型
+        """
+        model.eval()
+        total_loss = 0
+        correct = 0
+        total = 0
+        
+        with torch.no_grad():
+            for batch in val_dl:
+                numerical = batch['continuous'].to(device)
+                categorical = batch['categorical'].to(device)
+                target = batch['target'].to(device).squeeze()
+                
+                outputs = model({'continuous': numerical, 'categorical': categorical})
+                logits = outputs['logits']
+                loss = criterion(logits, target)
+                
+                total_loss += loss.item()
+                _, predicted = torch.max(logits, 1)
+                total += target.size(0)
+                correct += (predicted == target).sum().item()
+        
+        accuracy = correct / total
+        avg_loss = total_loss / len(val_dl)
+        
+        return accuracy, avg_loss
+    
+    # 詳細評估單個 fold 的性能
+    def _evaluate_fold(self, model, val_dl, device):
+        """
+        詳細評估單個 fold 的性能
+        """
+        model.eval()
+        predictions = []
+        true_labels = []
+        
+        with torch.no_grad():
+            for batch in val_dl:
+                numerical = batch['continuous'].to(device)
+                categorical = batch['categorical'].to(device)
+                target = batch['target'].to(device).squeeze()
+                
+                outputs = model({'continuous': numerical, 'categorical': categorical})
+                logits = outputs['logits']
+                _, preds = torch.max(logits, 1)
+                
+                predictions.extend(preds.cpu().numpy())
+                true_labels.extend(target.cpu().numpy())
+        
+        # 計算詳細指標
+        
+        accuracy = accuracy_score(true_labels, predictions)
+        precision = precision_score(true_labels, predictions, average='weighted', zero_division=0)
+        recall = recall_score(true_labels, predictions, average='weighted', zero_division=0)
+        f1 = f1_score(true_labels, predictions, average='weighted', zero_division=0)
+        
+        return {
+            'accuracy': accuracy,
+            'precision': precision,
+            'recall': recall,
+            'f1_score': f1,
+            'predictions': predictions,
+            'true_labels': true_labels
+        }
+
+    # 評估訓練集並繪製ROC曲線和混淆矩陣
+    def evaluate_train_set(self, model_name:str):
         """
         評估訓練集並繪製ROC曲線和混淆矩陣
         """
@@ -341,21 +759,18 @@ class CustomerFTTransformer:
         accuracy = accuracy_score(true_labels, predictions)
         print(f'Training Set Accuracy: {accuracy:.4f}')
         
-        # 顯示分類報告
-        print('\nTraining Set Classification Report:')
-        print(classification_report(true_labels, predictions))
-        
         # 計算混淆矩陣
         cm = confusion_matrix(true_labels, predictions)
         print('\nTraining Set Confusion Matrix:')
         print(cm)
         
         # 繪製混淆矩陣和ROC曲線
-        self._plot_train_metrics(true_labels, predictions, probabilities, cm)
+        self._plot_train_metrics(true_labels, predictions, probabilities, cm, model_name=model_name)
         
         return accuracy, cm
 
-    def _plot_train_metrics(self, true_labels, predictions, probabilities, cm):
+    # 繪製訓練集的ROC曲線和混淆矩陣
+    def _plot_train_metrics(self, true_labels, predictions, probabilities, cm, model_name="model"):
         """
         繪製訓練集的ROC曲線和混淆矩陣
         
@@ -364,12 +779,9 @@ class CustomerFTTransformer:
             predictions: 預測標籤
             probabilities: 預測概率
             cm: 混淆矩陣
+            model_name: 模型名稱，用於保存文件名
         """
         try:
-            import seaborn as sns
-            from sklearn.metrics import roc_curve, auc
-            import matplotlib
-            
             # 設定非互動式後端（適用於服務器環境）
             matplotlib.use('Agg')
             
@@ -424,9 +836,10 @@ class CustomerFTTransformer:
             
             plt.tight_layout()
             
-            # 保存圖片
-            plt.savefig('training_metrics.png', dpi=300, bbox_inches='tight', facecolor='white')
-            print("✅ 訓練集評估圖表已保存為 'training_metrics.png'")
+            # 保存圖片，使用model_name命名
+            filename = f'{model_name}_training_metrics.png'
+            plt.savefig(filename, dpi=300, bbox_inches='tight', facecolor='white')
+            print(f"✅ 訓練集評估圖表已保存為 '{filename}'")
             
             # 嘗試顯示圖片（如果在支援的環境中）
             try:
@@ -442,9 +855,9 @@ class CustomerFTTransformer:
             print("請安裝必要套件: pip install seaborn scikit-learn matplotlib")
         except Exception as e:
             print(f"無法創建訓練集評估圖表: {e}")
-            import traceback
             traceback.print_exc()
 
+    # 計算 class weights 用於平衡訓練
     def _compute_class_weights(self, device):
         """
         計算 class weights 用於平衡訓練
@@ -455,7 +868,6 @@ class CustomerFTTransformer:
         Returns:
             torch.Tensor: class weights tensor
         """
-        from sklearn.utils.class_weight import compute_class_weight
         
         # 使用當前（經過採樣後）的 y_train 來計算 class weights
         y_for_weights = self.train_target_df.values
@@ -486,15 +898,14 @@ class CustomerFTTransformer:
         
         return class_weight_tensor
 
+    # 獲取 class weights 資訊，用於調試
     def get_class_weights_info(self):
         """
         獲取 class weights 資訊，用於調試
         
         Returns:
             dict: 包含 class weights 和相關資訊的字典
-        """
-        from sklearn.utils.class_weight import compute_class_weight
-        
+        """        
         # 使用當前（經過採樣後）的資料分布
         if hasattr(self, 'train_target_df') and self.train_target_df is not None:
             y_for_weights = self.train_target_df.values
@@ -531,8 +942,57 @@ class CustomerFTTransformer:
     def evaluate_model(self, model_name: str):
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
         
-        self.model = FTTransformerModel(config=self.config)
-        self.model.load_state_dict(torch.load(f"./models/{model_name}"))
+        # 嘗試載入模型檔案
+        try:
+            model_state = torch.load(f"./models/{model_name}")
+            print(f"✅ 模型檔案載入成功: ./models/{model_name}")
+        except FileNotFoundError:
+            print(f"❌ 模型檔案不存在: ./models/{model_name}")
+            return None, None
+        
+        # 檢查模型架構是否匹配
+        try:
+            # 先嘗試用當前配置載入
+            self.model = FTTransformerModel(config=self.config)
+            self.model.load_state_dict(model_state)
+            print("✅ 模型架構匹配，直接載入成功")
+        except RuntimeError as e:
+            if "Unexpected key(s) in state_dict" in str(e):
+                print("⚠️ 模型架構不匹配，嘗試自動調整...")
+                
+                # 分析保存的模型有多少個attention blocks
+                attention_block_keys = [key for key in model_state.keys() if "mha_block_" in key]
+                if attention_block_keys:
+                    # 提取最大的block編號
+                    max_block_num = max([int(key.split("mha_block_")[1].split(".")[0]) for key in attention_block_keys])
+                    inferred_num_blocks = max_block_num + 1  # block編號從0開始
+                    
+                    print(f"🔍 檢測到保存的模型有 {inferred_num_blocks} 個attention blocks")
+                    print(f"📝 當前配置的attention blocks: {self.num_attn_blocks}")
+                    
+                    # 更新實例變量
+                    self.num_attn_blocks = inferred_num_blocks
+                    
+                    # 重新創建配置
+                    adjusted_config = FTTransformerConfig(
+                        task="classification",
+                        num_attn_blocks=self.num_attn_blocks,
+                    )
+                    adjusted_config = adjusted_config.merge_dataset_config(self.ds_train)
+                    
+                    # 用調整後的配置創建模型
+                    self.model = FTTransformerModel(config=adjusted_config)
+                    self.model.load_state_dict(model_state)
+                    print(f"✅ 模型架構已調整為 {self.num_attn_blocks} 個attention blocks並載入成功")
+                    
+                    # 更新模型配置
+                    self.config = adjusted_config
+                else:
+                    print("❌ 無法自動判斷模型架構，請檢查模型檔案")
+                    raise e
+            else:
+                raise e
+        
         self.model.to(device=device)        
         self.model.eval()
         
@@ -582,14 +1042,12 @@ class CustomerFTTransformer:
         self._plot_confusion_matrix(cm, unique_labels)
         
         return accuracy, cm
-    
+
     def _plot_confusion_matrix(self, cm, labels):
         """
         繪製混淆矩陣的視覺化圖表
         """
-        try:
-            import seaborn as sns
-            
+        try:            
             # 設定標籤映射
             if len(labels) == 2:
                 class_labels = ['Not Readmitted', 'Readmitted']
@@ -606,8 +1064,6 @@ class CustomerFTTransformer:
             plt.tight_layout()
             plt.show()
             
-            # 同時保存圖片
-            plt.savefig('confusion_matrix.png', dpi=300, bbox_inches='tight')
             print("混淆矩陣圖表已保存為 'confusion_matrix.png'")
             
         except ImportError:
@@ -678,6 +1134,7 @@ class CustomerFTTransformer:
 
         submission_df.to_csv(path_or_buf='data/submission_df.csv', index=False)
 
+    # 單獨繪製訓練集的ROC曲線和混淆矩陣（無需重新訓練）
     def plot_train_roc_and_confusion_matrix(self, model_name=None):
         """
         單獨繪製訓練集的ROC曲線和混淆矩陣（無需重新訓練）
@@ -688,8 +1145,58 @@ class CustomerFTTransformer:
         if model_name:
             # 載入指定的模型
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
-            self.model = FTTransformerModel(config=self.config)
-            self.model.load_state_dict(torch.load(f"./models/{model_name}"))
+            
+            # 嘗試載入模型檔案
+            try:
+                model_state = torch.load(f"./models/{model_name}")
+                print(f"✅ 模型檔案載入成功: ./models/{model_name}")
+            except FileNotFoundError:
+                print(f"❌ 模型檔案不存在: ./models/{model_name}")
+                return None
+            
+            # 檢查模型架構是否匹配
+            try:
+                # 先嘗試用當前配置載入
+                self.model = FTTransformerModel(config=self.config)
+                self.model.load_state_dict(model_state)
+                print("✅ 模型架構匹配，直接載入成功")
+            except RuntimeError as e:
+                if "Unexpected key(s) in state_dict" in str(e):
+                    print("⚠️ 模型架構不匹配，嘗試自動調整...")
+                    
+                    # 分析保存的模型有多少個attention blocks
+                    attention_block_keys = [key for key in model_state.keys() if "mha_block_" in key]
+                    if attention_block_keys:
+                        # 提取最大的block編號
+                        max_block_num = max([int(key.split("mha_block_")[1].split(".")[0]) for key in attention_block_keys])
+                        inferred_num_blocks = max_block_num + 1  # block編號從0開始
+                        
+                        print(f"🔍 檢測到保存的模型有 {inferred_num_blocks} 個attention blocks")
+                        print(f"📝 當前配置的attention blocks: {self.num_attn_blocks}")
+                        
+                        # 更新實例變量
+                        self.num_attn_blocks = inferred_num_blocks
+                        
+                        # 重新創建配置
+                        adjusted_config = FTTransformerConfig(
+                            task="classification",
+                            num_attn_blocks=self.num_attn_blocks,
+                        )
+                        adjusted_config = adjusted_config.merge_dataset_config(self.ds_train)
+                        
+                        # 用調整後的配置創建模型
+                        self.model = FTTransformerModel(config=adjusted_config)
+                        self.model.load_state_dict(model_state)
+                        print(f"✅ 模型架構已調整為 {self.num_attn_blocks} 個attention blocks並載入成功")
+                        
+                        # 更新模型配置
+                        self.config = adjusted_config
+                    else:
+                        print("❌ 無法自動判斷模型架構，請檢查模型檔案")
+                        raise e
+                else:
+                    raise e
+            
             self.model.to(device)
             print(f"Model loaded from ./models/{model_name}")
         
@@ -698,4 +1205,40 @@ class CustomerFTTransformer:
             return None
         
         print("🔍 Evaluating training set...")
-        return self.evaluate_train_set()
+        return self.evaluate_train_set(model_name=model_name)
+
+    def get_model_info(self):
+        """
+        顯示當前模型配置資訊
+        """
+        print(f"\n{'='*50}")
+        print(f"🤖 模型配置資訊")
+        print(f"{'='*50}")
+        print(f"Attention Blocks: {self.num_attn_blocks}")
+        print(f"Task: {self.model_config.task}")
+        
+        if hasattr(self, 'config') and self.config is not None:
+            print(f"配置已合併: ✅")
+            if hasattr(self.config, 'd_out'):
+                print(f"輸出維度: {self.config.d_out}")
+        else:
+            print(f"配置已合併: ❌")
+            
+        if hasattr(self, 'model') and self.model is not None:
+            print(f"模型已初始化: ✅")
+            # 計算模型參數數量
+            total_params = sum(p.numel() for p in self.model.parameters())
+            trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+            print(f"總參數數量: {total_params:,}")
+            print(f"可訓練參數: {trainable_params:,}")
+        else:
+            print(f"模型已初始化: ❌")
+        
+        print(f"{'='*50}")
+        
+        return {
+            'num_attn_blocks': self.num_attn_blocks,
+            'task': self.model_config.task,
+            'config_merged': hasattr(self, 'config') and self.config is not None,
+            'model_initialized': hasattr(self, 'model') and self.model is not None
+        }
